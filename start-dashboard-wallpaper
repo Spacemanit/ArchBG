@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DASHBOARD_BIN="$SCRIPT_DIR/live-desktop-dashboard"
+if [[ ! -x "$DASHBOARD_BIN" ]]; then
+    DASHBOARD_BIN="$HOME/.local/bin/live-desktop-dashboard"
+fi
+
+# Stop any existing dashboard
+pkill -f "live-desktop-dashboard" 2>/dev/null
+# Stop linux-wallpaperengine if running on the bottom layer
+pkill -f linux-wallpaperengine 2>/dev/null
+sleep 0.3
+
+# Run as a wlr-layer-shell surface on the BACKGROUND layer (same layer as real wallpapers),
+# so normal windows always render above it. Never takes keyboard focus.
+nohup kitten panel \
+    --edge=background \
+    --focus-policy=not-allowed \
+    --class=live-wallpaper-dashboard \
+    --override font_size=10 \
+    --override background=#000000 \
+    --override background_opacity=1.0 \
+    --override window_padding_width=10 \
+    --override cursor_blink_interval=0 \
+    --override confirm_os_window_close=0 \
+    "$DASHBOARD_BIN" >/dev/null 2>&1 &
+disown

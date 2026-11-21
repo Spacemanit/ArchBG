@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+"""
+Live Desktop Wallpaper Dashboard (Bento Grid Layout):
+┌────────────────────────┐  ┌────────────────────────┐
+│                        │  │ UPPER RIGHT:           │
+│ LEFT (Full Height):    │  │ Braille Radial Audio   │
+│ Sanitized Live Logs    │  │ Spectrum Visualizer    │
+│ (structured, semantic  │  └────────────────────────┘
+│  highlighting)         │  ┌────────────────────────┐
+│                        │  │ LOWER RIGHT:           │
+│                        │  │ 3D Shaded Arch Logo    │
+│                        │  │ + Live System Vitals   │
+└────────────────────────┘  └────────────────────────┘
+OLED Pitch-Black Background
+"""
+
+import curses
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+
+LOG_QUEUE = deque(maxlen=120)
+AUDIO_BARS = [0.0] * 64
+PEAK_BARS = [0.0] * 64
+RUNNING = True
+
+HOST = socket.gethostname()
+PATTERNS = [
+    # Hostname (username, Wi-Fi SSIDs, Bluetooth & USB device names intentionally left unredacted)
+    (re.compile(rf"\b{re.escape(HOST)}\b"), "[REDACTED]"),
+    # URLs with embedded credentials
+    (re.compile(r"\b[a-zA-Z][a-zA-Z0-9+.-]*://[^/\s:@]+:[^/\s@]+@[^\s]+"), "[REDACTED]"),
+    # Bearer / Basic auth tokens
+    (re.compile(r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._\-+/=]{8,}"), r"\1 [REDACTED]"),
+    # Passwords, secrets, API keys, tokens, cookies, session IDs
+    (
+        re.compile(
+            r"(?i)\b(password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth(?:orization)?|cookie|session[_-]?id)\s*([:=])\s*['\"]?[^\s'\",;}{]+['\"]?"
+        ),
+        r"\1\2[REDACTED]",
+    ),
+    # Hardware / device serial numbers
+    (
+        re.compile(r"(?i)\b(serial(?:number)?)\s*([:=])\s*['\"]?[^\s'\",;]+['\"]?"),
+        r"\1\2[REDACTED]",
+    ),
+    # MAC addresses (6-byte MACs and 14-byte UFW Ethernet header MACs)
+    (re.compile(r"\b(?:[0-9a-fA-F]{2}[:-]){5,}[0-9a-fA-F]{2}\b"), "[REDACTED]"),
+    # UUIDs
+    (
+        re.compile(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b"
+        ),
+        "[REDACTED]",
+    ),
+    # IPv4 addresses
+    (
+        re.compile(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"
+        ),
+        "[REDACTED]",
+    ),
+    # IPv6 addresses (full or :: compressed, avoiding timestamps, PCI IDs, and C++ ::)
+    (
+        re.compile(
+            r"(?<![:\w])(?:[0-9a-fA-F]{1,4}:){3,7}[0-9a-fA-F]{1,4}(?:%[A-Za-z0-9_.-]+)?(?![:\w.])"
+        ),
+        "[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"(?<![:\w])(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?(?:%[A-Za-z0-9_.-]+)?(?![:\w.])"
+        ),
+        "[REDACTED]",
+    ),
+    # Email addresses
+    (re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"), "[REDACTED]"),
+    # Long 32+ char hex identifiers (machine-id, hashes, session hex)
+    (re.compile(r"\b[0-9a-fA-F]{32,}\b"), "[REDACTED]"),
+]
+
+REDACTED_TOKEN_RE = re.compile(r"(\[REDACTED\])")
+
+
+def sanitize(line: str) -> str:
+    for rx, repl in PATTERNS:
+        line = rx.sub(repl, line)
+    return line
+
+
+# -------------------------------------------------------------
+# 1. Log Consumer Thread (journalctl)
+# -------------------------------------------------------------
+def log_worker():
+    global LOG_QUEUE, RUNNING
+    cmd = ["journalctl", "-f", "-n", "60", "--output=short-iso", "--no-pager"]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        errors="replace",
+    )
+    while RUNNING:
+        line = proc.stdout.readline()
+        if not line:
+            time.sleep(0.08)
+            continue
+        line = line.strip()
+        if line:
+            LOG_QUEUE.append(sanitize(line))
+    proc.terminate()
+
+
+# -------------------------------------------------------------
+# 2. Custom Audio Analyzer Thread (parec -> numpy FFT)
+# -------------------------------------------------------------
+NUM_BANDS = 64
+SAMPLE_RATE = 44100
+FFT_SIZE = 2048
+
+
+def audio_worker():
+    global AUDIO_BARS, PEAK_BARS, RUNNING
+    import numpy as np
+
+    try:
+        sink = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        ).stdout.strip()
+    except Exception:
+        sink = "@DEFAULT_SINK@"
+
+    cmd = [
+        "parec",
+        "--device",
+        f"{sink}.monitor",
+        "--format=s16le",
+        f"--rate={SAMPLE_RATE}",
+        "--channels=1",
+        "--latency-msec=20",
+    ]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
+    window = np.hanning(FFT_SIZE)
+    freqs = np.fft.rfftfreq(FFT_SIZE, 1.0 / SAMPLE_RATE)
+    edges = np.logspace(math.log10(45), math.log10(14000), NUM_BANDS + 1)
+    spans = []
+    for i in range(NUM_BANDS):
+        a = int(np.searchsorted(freqs, edges[i]))
+        b = max(int(np.searchsorted(freqs, edges[i + 1])), a + 1)
+        spans.append((a, b))
+
+    tilt = np.linspace(1.0, 3.4, NUM_BANDS)
+    buf = np.zeros(FFT_SIZE)
+    smooth = np.zeros(NUM_BANDS)
+    peaks = np.zeros(NUM_BANDS)
+    peak_gain = 0.05
+    chunk = 1024
+
+    while RUNNING:
+        data = proc.stdout.read(chunk * 2)
+        if not data or len(data) < chunk * 2:
+            time.sleep(0.02)
+            continue
+        s = np.frombuffer(data, dtype=np.int16).astype(np.float64) / 32768.0
+        buf = np.roll(buf, -chunk)
+        buf[-chunk:] = s
+
+        spec = np.abs(np.fft.rfft(buf * window)) / FFT_SIZE
+        mag = np.array([spec[a:b].max() for a, b in spans]) * tilt
+        mag = np.sqrt(mag)
+
+        peak_gain = max(peak_gain * 0.997, float(mag.max()), 0.12)
+        norm = np.clip(mag / peak_gain, 0.0, 1.0)
+
+        smooth = np.where(norm > smooth, norm * 0.75 + smooth * 0.25, smooth * 0.86 + norm * 0.14)
+        peaks = np.where(smooth > peaks, smooth, np.maximum(0.0, peaks - 0.012))
+
+        AUDIO_BARS = smooth.tolist()
+        PEAK_BARS = peaks.tolist()
+
+    proc.terminate()
+
+
+# -------------------------------------------------------------
+# 3. Lightweight System Vitals (/proc, zero subprocesses)
+# -------------------------------------------------------------
+class SystemVitals:
+    def __init__(self):
+        self.cpu_pct = 0.0
+        self.mem_pct = 0.0
+        self.mem_used_gb = 0.0
+        self.mem_total_gb = 0.0
+        self.uptime_str = "0m"
+        self.cpu_hist = deque([0.0] * 12, maxlen=12)
+        self._prev_total = 0
+        self._prev_idle = 0
+        self._last_poll = 0.0
+
+    def update(self, now: float):
+        if now - self._last_poll < 1.0:
+            return
+        self._last_poll = now
+        try:
+            with open("/proc/stat", "r") as f:
+                parts = f.readline().split()
+            vals = [int(x) for x in parts[1:9]]
+            idle = vals[3] + vals[4]
+            total = sum(vals)
+            if self._prev_total > 0 and total > self._prev_total:
+                dt_total = total - self._prev_total
+                dt_idle = idle - self._prev_idle
+                self.cpu_pct = max(0.0, min(100.0, 100.0 * (1.0 - dt_idle / dt_total)))
+                self.cpu_hist.append(self.cpu_pct)
+            self._prev_total, self._prev_idle = total, idle
+        except Exception:
+            pass
+
+        try:
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    mem[k] = int(v.strip().split()[0])
+                    if len(mem) >= 6 and "MemTotal" in mem and "MemAvailable" in mem:
+                        break
+            total_kb = mem.get("MemTotal", 1)
+            avail_kb = mem.get("MemAvailable", 0)
+            used_kb = max(0, total_kb - avail_kb)
+            self.mem_pct = 100.0 * used_kb / total_kb
+            self.mem_used_gb = used_kb / (1024 * 1024)
+            self.mem_total_gb = total_kb / (1024 * 1024)
+        except Exception:
+            pass
+
+        try:
+            with open("/proc/uptime", "r") as f:
+                secs = int(float(f.readline().split()[0]))
+            days, rem = divmod(secs, 86400)
+            hrs, rem = divmod(rem, 3600)
+            mins = rem // 60
+            if days > 0:
+                self.uptime_str = f"{days}d {hrs}h"
+            elif hrs > 0:
+                self.uptime_str = f"{hrs}h {mins:02d}m"
+            else:
+                self.uptime_str = f"{mins}m"
+        except Exception:
+            pass
+
+
+# -------------------------------------------------------------
+# 4. High-Density 3D Arch Linux Chevron Mesh + Normals
+# -------------------------------------------------------------
+def _point_in_poly(x: float, y: float, poly) -> bool:
+    inside = False
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def build_arch_mesh():
+    """
+    Build a solid extruded 3D Arch Linux chevron with surface normals:
+    returns list of (x, y, z, nx, ny, nz).
+    """
+    # Classic Arch Linux silhouette (normalized roughly to [-1.15..1.15] x [-1.2..1.25])
+    poly = [
+        (0.00, 1.25),    # sharp top apex
+        (0.24, 0.70),    # right upper edge
+        (0.45, 0.25),
+        (0.32, 0.28),    # subtle right inner notch
+        (0.55, 0.08),
+        (0.86, -0.58),
+        (1.16, -1.16),   # bottom-right foot
+        (0.82, -1.02),   # arch inner right sweep
+        (0.52, -0.94),
+        (0.34, -0.82),
+        (0.26, -0.58),   # inner arch dome right
+        (0.18, -0.34),
+        (0.00, -0.24),   # inner arch dome apex
+        (-0.18, -0.34),
+        (-0.26, -0.58),  # inner arch dome left
+        (-0.34, -0.82),
+        (-0.52, -0.94),
+        (-0.82, -1.02),
+        (-1.16, -1.16),  # bottom-left foot
+        (-0.86, -0.58),
+        (-0.55, 0.08),
+        (-0.32, 0.28),   # subtle left inner notch
+        (-0.45, 0.25),
+        (-0.24, 0.70),
+    ]
+
+    pts = []
+    half_d = 0.20
+
+    # Front and back faces (dense grid)
+    step = 0.062
+    y = -1.18
+    while y <= 1.26:
+        x = -1.18
+        while x <= 1.18:
+            if _point_in_poly(x, y, poly):
+                pts.append((x, y, half_d, 0.0, 0.0, 1.0))
+                pts.append((x, y, -half_d, 0.0, 0.0, -1.0))
+            x += step
+        y += step
+
+    # Extruded side walls with outward normals
+    n = len(poly)
+    z_layers = 7
+    for i in range(n):
+        x0, y0 = poly[i]
+        x1, y1 = poly[(i + 1) % n]
+        dx, dy = x1 - x0, y1 - y0
+        seg_len = math.hypot(dx, dy)
+        if seg_len < 1e-6:
+            continue
+        # Polygon is clockwise -> outward normal is (-dy, dx)
+        nx, ny = -dy / seg_len, dx / seg_len
+        steps = max(2, int(seg_len / 0.055))
+        for s in range(steps):
+            t = s / steps
+            px = x0 + dx * t
+            py = y0 + dy * t
+            for kz in range(z_layers):
+                pz = -half_d + (2.0 * half_d) * (kz / (z_layers - 1))
+                pts.append((px, py, pz, nx, ny, 0.0))
+
+    return pts
+
+
+def build_orbital_ring():
+    """Subtle tilted 3D halo ring around the Arch core."""
+    ring = []
+    num = 64
+    r = 1.62
+    for i in range(num):
+        a = 2.0 * math.pi * i / num
+        ring.append((r * math.cos(a), 0.15 * math.sin(a * 2.0), r * math.sin(a)))
+    return ring
+
+
+ARCH_MESH = build_arch_mesh()
+ORBIT_RING = build_orbital_ring()
+
+# -------------------------------------------------------------
+# 5. Braille Subpixel Canvas Helper (2x4 dots per cell)
+# -------------------------------------------------------------
+BRAILLE_BITS = (
+    (0x01, 0x08),
+    (0x02, 0x10),
+    (0x04, 0x20),
+    (0x40, 0x80),
+)
+
+
+class BrailleCanvas:
+    """High-resolution 2x4 subpixel canvas using Unicode Braille patterns."""
+
+    def __init__(self, x0: int, y0: int, cols: int, rows: int):
+        self.x0 = x0
+        self.y0 = y0
+        self.cols = max(1, cols)
+        self.rows = max(1, rows)
+        self.w = self.cols * 2
+        self.h = self.rows * 4
+        # (cell_y, cell_x) -> [bitmask, color_attr, priority]
+        self.cells = {}
+
+    def set_px(self, px: int, py: int, attr: int, priority: int = 1):
+        if 0 <= px < self.w and 0 <= py < self.h:
+            cx, dx = divmod(px, 2)
+            cy, dy = divmod(py, 4)
+            bit = BRAILLE_BITS[dy][dx]
+            key = (cy, cx)
+            cell = self.cells.get(key)
+            if cell is None:
+                self.cells[key] = [bit, attr, priority]
+            else:
+                cell[0] |= bit
+                if priority >= cell[2]:
+                    cell[1] = attr
+                    cell[2] = priority
+
+    def draw_line(self, x0: float, y0: float, x1: float, y1: float, attr: int, priority: int = 1):
+        dx = x1 - x0
+        dy = y1 - y0
+        steps = max(1, int(max(abs(dx), abs(dy)) * 1.25))
+        for i in range(steps + 1):
+            t = i / steps
+            self.set_px(int(round(x0 + dx * t)), int(round(y0 + dy * t)), attr, priority)
+
+    def render(self, stdscr):
+        for (cy, cx), (mask, attr, _) in self.cells.items():
+            try:
+                stdscr.addch(self.y0 + cy, self.x0 + cx, chr(0x2800 + mask), attr)
+            except curses.error:
+                pass
+
+
+# -------------------------------------------------------------
+# 6. UI Drawing Primitives (Bento Cards, Badges, Bars)
+# -------------------------------------------------------------
+def safe_addstr(stdscr, y: int, x: int, text: str, attr: int = 0):
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
+def draw_card(stdscr, y: int, x: int, h: int, w: int, title: str, badge: str, border_attr: int, title_attr: int, badge_attr: int):
+    """Draw a sleek rounded-corner bento panel with title and right-aligned badge."""
+    if h < 4 or w < 12:
+        return
+
+    # Top border
+    safe_addstr(stdscr, y, x, "╭" + "─" * (w - 2) + "╮", border_attr)
+    # Side borders
+    for r in range(y + 1, y + h - 1):
+        safe_addstr(stdscr, r, x, "│", border_attr)
+        safe_addstr(stdscr, r, x + w - 1, "│", border_attr)
+    # Bottom border
+    safe_addstr(stdscr, y + h - 1, x, "╰" + "─" * (w - 2) + "╯", border_attr)
+
+    # Embedded title on top border
+    if title:
+        t_str = f" {title} "
+        if len(t_str) < w - 6:
+            safe_addstr(stdscr, y, x + 2, t_str, title_attr)
+
+    # Right-aligned status badge on top border
+    if badge:
+        b_str = f" {badge} "
+        bx = x + w - len(b_str) - 2
+        if bx > x + len(title) + 5:
+            safe_addstr(stdscr, y, bx, b_str, badge_attr)
+
+
+def render_bar(pct: float, width: int) -> str:
+    filled = int(round(max(0.0, min(100.0, pct)) / 100.0 * width))
+    return "━" * filled + "╌" * (width - filled)
+
+
+def render_sparkline(values) -> str:
+    blocks = "▁▂▃▄▅▆▇█"
+    out = []
+    for v in values:
+        idx = int(max(0.0, min(100.0, v)) / 100.0 * (len(blocks) - 1))
+        out.append(blocks[idx])
+    return "".join(out)
+
+
+def parse_log_line(raw_log: str):
+    """Split journalctl short-iso line into (time_str, unit, message)."""
+    parts = raw_log.split(" ", 2)
+    if len(parts) >= 3:
+        ts = parts[0].split("T")[-1][:8]
+        rest = parts[2]
+    else:
+        ts = "──:──:──"
+        rest = raw_log
+
+    if ": " in rest:
+        unit_raw, msg = rest.split(": ", 1)
+        # Strip [pid] from unit name for clean alignment
+        unit = unit_raw.split("[", 1)[0].strip()
+    else:
+        unit = "sys"
+        msg = rest
+
+    return ts, unit, msg
+
+
+# -------------------------------------------------------------
+# 7. Main Curses Renderer
+# -------------------------------------------------------------
+def main(stdscr):
+    global RUNNING
+    curses.curs_set(0)
+    stdscr.nodelay(True)
+    stdscr.timeout(25)  # ~40 FPS
+
+    curses.start_color()
+    curses.use_default_colors()
+
+    use_256 = curses.COLORS >= 256
+
+    if use_256:
+        # Material-You / Periwinkle / Ice-Cyan / Lilac palette on OLED black
+        curses.init_pair(1, 238, -1)   # subtle slate border
+        curses.init_pair(2, 242, -1)   # dim timestamps / muted chrome
+        curses.init_pair(3, 246, -1)   # secondary text
+        curses.init_pair(4, 252, -1)   # crisp frost log text
+        curses.init_pair(5, 255, -1)   # pure white highlight
+        curses.init_pair(6, 111, -1)   # primary periwinkle blue
+        curses.init_pair(7, 117, -1)   # glacial cyan
+        curses.init_pair(8, 183, -1)   # soft orchid lilac
+        curses.init_pair(9, 218, -1)   # pastel pink
+        curses.init_pair(10, 115, -1)  # soft mint (live/ok)
+        curses.init_pair(11, 221, -1)  # warm amber (warn)
+        curses.init_pair(12, 210, -1)  # soft coral (error)
+        curses.init_pair(13, 141, -1)  # violet (redacted tokens)
+        curses.init_pair(14, 60, -1)   # muted indigo-slate (unit tag / accents)
+
+        vis_ids = [63, 69, 75, 81, 117, 123, 159, 153, 147, 183, 218, 219]
+        arch_ids = [24, 31, 38, 45, 81, 117, 159, 255]
+    else:
+        curses.init_pair(1, curses.COLOR_WHITE, -1)
+        curses.init_pair(2, curses.COLOR_WHITE, -1)
+        curses.init_pair(3, curses.COLOR_WHITE, -1)
+        curses.init_pair(4, curses.COLOR_WHITE, -1)
+        curses.init_pair(5, curses.COLOR_WHITE, -1)
+        curses.init_pair(6, curses.COLOR_BLUE, -1)
+        curses.init_pair(7, curses.COLOR_CYAN, -1)
+        curses.init_pair(8, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(9, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(10, curses.COLOR_GREEN, -1)
+        curses.init_pair(11, curses.COLOR_YELLOW, -1)
+        curses.init_pair(12, curses.COLOR_RED, -1)
+        curses.init_pair(13, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(14, curses.COLOR_BLUE, -1)
+
+        vis_ids = [curses.COLOR_BLUE, curses.COLOR_CYAN, curses.COLOR_MAGENTA, curses.COLOR_WHITE]
+        arch_ids = [curses.COLOR_BLUE, curses.COLOR_CYAN, curses.COLOR_WHITE]
+
+    C_BORDER = curses.color_pair(1)
+    C_DIM = curses.color_pair(2)
+    C_MUTED = curses.color_pair(3)
+    C_TEXT = curses.color_pair(4)
+    C_WHITE = curses.color_pair(5) | curses.A_BOLD
+    C_PRIMARY = curses.color_pair(6) | curses.A_BOLD
+    C_CYAN = curses.color_pair(7) | curses.A_BOLD
+    C_CYAN_REG = curses.color_pair(7)
+    C_LILAC = curses.color_pair(8) | curses.A_BOLD
+    C_PINK = curses.color_pair(9)
+    C_MINT = curses.color_pair(10)
+    C_MINT_BOLD = curses.color_pair(10) | curses.A_BOLD
+    C_AMBER = curses.color_pair(11) | curses.A_BOLD
+    C_ROSE = curses.color_pair(12) | curses.A_BOLD
+    C_REDACTED = curses.color_pair(13) | curses.A_BOLD
+    C_UNIT = curses.color_pair(14)
+
+    VIS_PALETTE = []
+    for i, cid in enumerate(vis_ids):
+        curses.init_pair(20 + i, cid, -1)
+        VIS_PALETTE.append(curses.color_pair(20 + i))
+
+    ARCH_PALETTE = []
+    for i, cid in enumerate(arch_ids):
+        curses.init_pair(40 + i, cid, -1)
+        ARCH_PALETTE.append(curses.color_pair(40 + i))
+
+    SHADER_CHARS = " ·:;=+*#%@"
+    vitals = SystemVitals()
+
+    # Light direction (normalized) for 3D Arch shading
+    lx, ly, lz = -0.42, 0.58, 0.70
+    l_norm = math.sqrt(lx * lx + ly * ly + lz * lz)
+    lx, ly, lz = lx / l_norm, ly / l_norm, lz / l_norm
+
+    angle_y = 0.0
+    t1 = threading.Thread(target=log_worker, daemon=True)
+    t2 = threading.Thread(target=audio_worker, daemon=True)
+    t1.start()
+    t2.start()
+
+    last_time = time.time()
+
+    while True:
+        try:
+            ch = stdscr.getch()
+            if ch in (ord("q"), ord("Q"), 27):
+                RUNNING = False
+                break
+        except Exception:
+            pass
+
+        now = time.time()
+        dt = min(0.1, max(0.001, now - last_time))
+        last_time = now
+        angle_y += 0.95 * dt
+        angle_x = 0.22 + 0.10 * math.sin(now * 0.55)
+
+        vitals.update(now)
+
+        max_y, max_x = stdscr.getmaxyx()
+        if max_y < 18 or max_x < 70:
+            stdscr.erase()
+            safe_addstr(stdscr, 0, 0, "Terminal too small...", C_WHITE)
+            stdscr.refresh()
+            continue
+
+        stdscr.erase()
+
+        # Leave breathing room at the top for Waybar (~50px -> ~3 rows)
+        top_pad = 3 if max_y >= 28 else 1
+        bottom_pad = 1
+        side_pad = 2
+        gap_x = 2
+        gap_y = 1
+
+        usable_w = max_x - side_pad * 2 - gap_x
+        usable_h = max_y - top_pad - bottom_pad
+
+        w_left = int(usable_w * 0.54)
+        w_right = usable_w - w_left
+        x_left = side_pad
+        x_right = side_pad + w_left + gap_x
+
+        h_top_right = (usable_h - gap_y) // 2
+        h_bot_right = usable_h - gap_y - h_top_right
+        y_top = top_pad
+        y_bot_right = top_pad + h_top_right + gap_y
+
+        pulse_dot = "●" if int(now * 2.0) % 2 == 0 else "○"
+
+        # =====================================================
+        # 1. LEFT BENTO CARD: LIVE SANITIZED SYSTEM LOGS
+        # =====================================================
+        draw_card(
+            stdscr,
+            y_top,
+            x_left,
+            usable_h,
+            w_left,
+            "󰞌 SYSTEM JOURNAL",
+            f"{pulse_dot} LIVE · 󰒃 SANITIZED",
+            C_BORDER,
+            C_PRIMARY,
+            C_MINT,
+        )
+
+        try:
+            inner_x = x_left + 2
+            inner_w = w_left - 4
+            visible_lines = usable_h - 3
+            logs = list(LOG_QUEUE)[-visible_lines:]
+
+            unit_col_w = 13 if inner_w >= 54 else 9
+            msg_offset = 10 + 2 + unit_col_w + 2  # "HH:MM:SS " + "● " + unit + "  "
+            max_msg_len = max(8, inner_w - msg_offset)
+
+            total_shown = len(logs)
+            for idx, raw_log in enumerate(logs):
+                row = y_top + 1 + idx
+                if row >= y_top + usable_h - 1:
+                    break
+
+                ts, unit, msg = parse_log_line(raw_log)
+                low = msg.lower()
+                is_err = any(k in low for k in ("error", "fail", "crit", "panic", "denied", "segfault"))
+                is_warn = (not is_err) and any(k in low for k in ("warn", "timeout", "retry", "deprecated"))
+                is_kern = "kernel" in unit.lower()
+                is_newest = idx == total_shown - 1
+
+                if is_err:
+                    glyph, glyph_attr = "●", C_ROSE
+                    msg_attr = C_ROSE
+                elif is_warn:
+                    glyph, glyph_attr = "▲", C_AMBER
+                    msg_attr = C_AMBER
+                elif is_kern:
+                    glyph, glyph_attr = "◆", C_CYAN_REG
+                    msg_attr = C_CYAN_REG
+                else:
+                    glyph = "▸" if is_newest else "·"
+                    glyph_attr = C_MINT_BOLD if is_newest else C_DIM
+                    msg_attr = C_WHITE if is_newest else (C_TEXT if idx >= total_shown - 10 else C_MUTED)
+
+                unit_disp = unit[:unit_col_w].ljust(unit_col_w)
+                if len(msg) > max_msg_len:
+                    msg = msg[: max_msg_len - 1] + "…"
+
+                safe_addstr(stdscr, row, inner_x, f"{ts} ", C_DIM)
+                safe_addstr(stdscr, row, inner_x + 9, f"{glyph} ", glyph_attr)
+                safe_addstr(stdscr, row, inner_x + 11, unit_disp, C_CYAN_REG if is_kern else C_UNIT)
+
+                # Render message with subtle violet highlight on [REDACTED]/[IP]/[WIFI]
+                col = inner_x + 11 + unit_col_w + 1
+                limit_x = x_left + w_left - 2
+                for seg in REDACTED_TOKEN_RE.split(msg):
+                    if not seg or col >= limit_x:
+                        break
+                    avail = limit_x - col
+                    piece = seg[:avail]
+                    attr = C_REDACTED if REDACTED_TOKEN_RE.fullmatch(seg) else msg_attr
+                    safe_addstr(stdscr, row, col, piece, attr)
+                    col += len(piece)
+        except Exception:
+            pass
+
+        # =====================================================
+        # 2. UPPER RIGHT BENTO CARD: BRAILLE RADIAL SPECTRUM
+        # =====================================================
+        bars = list(AUDIO_BARS)
+        peaks = list(PEAK_BARS)
+        energy = (sum(bars) / len(bars)) if bars else 0.0
+        audio_active = energy > 0.015
+
+        draw_card(
+            stdscr,
+            y_top,
+            x_right,
+            h_top_right,
+            w_right,
+            "󰎈 RADIAL SPECTRUM",
+            f"{pulse_dot} ACTIVE" if audio_active else "◌ AMBIENT",
+            C_BORDER,
+            C_LILAC,
+            C_PINK if audio_active else C_DIM,
+        )
+
+        try:
+            vx0 = x_right + 2
+            vy0 = y_top + 1
+            v_cols = w_right - 4
+            v_rows = h_top_right - 2
+
+            if v_cols >= 12 and v_rows >= 6:
+                canvas = BrailleCanvas(vx0, vy0, v_cols, v_rows)
+                cx = canvas.w / 2.0
+                cy = canvas.h / 2.0
+                r_max = min(canvas.w, canvas.h) * 0.45
+                r_in = r_max * 0.30
+
+                nb = len(bars)
+                bass = sum(bars[:6]) / 6.0 if nb >= 6 else 0.0
+                spin = now * 0.14
+                pal_n = len(VIS_PALETTE)
+
+                # Ambient gentle breathing halo when silent
+                idle_wave = 0.055 if not audio_active else 0.0
+
+                # Inner pulsing double halo
+                inner_r = r_in * (0.78 + 0.22 * bass + (0.04 * math.sin(now * 2.0) if not audio_active else 0.0))
+                halo_color = VIS_PALETTE[min(pal_n - 1, int((0.15 + bass * 0.7) * (pal_n - 1)))]
+                ring_steps = 120
+                for k in range(ring_steps):
+                    a = 2.0 * math.pi * k / ring_steps
+                    px = int(round(cx + math.cos(a) * inner_r))
+                    py = int(round(cy + math.sin(a) * inner_r))
+                    canvas.set_px(px, py, halo_color, priority=2)
+
+                # Outer subtle guide ring
+                for k in range(0, 120, 3):
+                    a = 2.0 * math.pi * k / 120 - spin * 0.5
+                    px = int(round(cx + math.cos(a) * (r_max * 1.02)))
+                    py = int(round(cy + math.sin(a) * (r_max * 1.02)))
+                    canvas.set_px(px, py, C_BORDER, priority=0)
+
+                # Mirrored radial rays + smooth outer waveform + peak sparks
+                rays = 96
+                tip_pts = []
+                for k in range(rays):
+                    frac = k / rays
+                    m = 1.0 - abs(2.0 * frac - 1.0)
+                    band = min(nb - 1, int(m * (nb - 1))) if nb > 0 else 0
+                    val = bars[band] if nb > 0 else 0.0
+                    pk = peaks[band] if nb > 0 else 0.0
+
+                    # Subtle organic idle undulation when silent
+                    if idle_wave > 0.0:
+                        val = max(
+                            val,
+                            idle_wave
+                            * (0.55 + 0.45 * math.sin(frac * 6.0 * math.pi + now * 1.8) * math.cos(now * 0.9)),
+                        )
+
+                    a = -math.pi / 2.0 + 2.0 * math.pi * frac + spin
+                    ca, sa = math.cos(a), math.sin(a)
+                    c_idx = min(pal_n - 1, int(m * (pal_n - 1)))
+                    ray_attr = VIS_PALETTE[c_idx]
+                    tip_attr = VIS_PALETTE[c_idx] | curses.A_BOLD
+
+                    r_end = r_in + (0.04 + val * 0.92) * (r_max - r_in)
+                    x_start = cx + ca * (r_in * 0.96)
+                    y_start = cy + sa * (r_in * 0.96)
+                    x_end = cx + ca * r_end
+                    y_end = cy + sa * r_end
+
+                    # Draw ray on every other step to keep airy elegance, plus full contour
+                    if k % 2 == 0:
+                        canvas.draw_line(x_start, y_start, x_end, y_end, ray_attr, priority=2)
+
+                    tip_pts.append((x_end, y_end, tip_attr))
+
+                    # Floating peak-hold spark
+                    if pk > 0.06:
+                        r_pk = r_in + (0.06 + pk * 0.95) * (r_max - r_in)
+                        canvas.set_px(
+                            int(round(cx + ca * r_pk)),
+                            int(round(cy + sa * r_pk)),
+                            tip_attr,
+                            priority=4,
+                        )
+
+                # Connect tips into a silky smooth closed waveform contour
+                for k in range(rays):
+                    x0, y0, attr0 = tip_pts[k]
+                    x1, y1, _ = tip_pts[(k + 1) % rays]
+                    canvas.draw_line(x0, y0, x1, y1, attr0, priority=3)
+
+                canvas.render(stdscr)
+
+                # Center minimal label inside the inner ring
+                center_row = vy0 + v_rows // 2
+                center_col = vx0 + v_cols // 2
+                if r_in >= 10:
+                    icon_txt = "󰎈"
+                    safe_addstr(stdscr, center_row, center_col - len(icon_txt) // 2, icon_txt, C_LILAC if audio_active else C_DIM)
+        except Exception:
+            pass
+
+        # =====================================================
+        # 3. LOWER RIGHT BENTO CARD: 3D ARCH CORE + SYSTEM VITALS
+        # =====================================================
+        draw_card(
+            stdscr,
+            y_bot_right,
+            x_right,
+            h_bot_right,
+            w_right,
+            "󰣇 ARCH CORE",
+            f"UP {vitals.uptime_str}",
+            C_BORDER,
+            C_CYAN,
+            C_MUTED,
+        )
+
+        try:
+            ay0 = y_bot_right + 1
+            ax0 = x_right + 2
+            a_w = w_right - 4
+            # Reserve 2 rows at bottom of card for vitals divider + strip
+            show_vitals = h_bot_right >= 10 and a_w >= 38
+            a_h = h_bot_right - (4 if show_vitals else 2)
+
+            cx = ax0 + a_w // 2
+            cy = ay0 + a_h // 2
+
+            cos_y, sin_y = math.cos(angle_y), math.sin(angle_y)
+            cos_x, sin_x = math.cos(angle_x), math.sin(angle_x)
+
+            # Fit cleanly inside card
+            scale_y = max(3.5, min(a_h * 0.42, 11.5))
+            scale_x = scale_y * 2.05  # compensate ~2:1 terminal cell aspect
+
+            z_buffer = {}
+            arch_pal_n = len(ARCH_PALETTE)
+            sh_n = len(SHADER_CHARS) - 1
+
+            # Draw tilted orbital halo ring (behind and in front of logo via z-buffer)
+            orb_ang = -now * 0.45
+            oc, os_ = math.cos(orb_ang), math.sin(orb_ang)
+            tilt_c, tilt_s = math.cos(0.42), math.sin(0.42)
+            for rx0, ry0, rz0 in ORBIT_RING:
+                rx1 = rx0 * oc + rz0 * os_
+                rz1 = -rx0 * os_ + rz0 * oc
+                ry2 = ry0 * tilt_c - rz1 * tilt_s
+                rz2 = ry0 * tilt_s + rz1 * tilt_c + 3.6
+                inv_z = 2.6 / rz2
+                sx = int(round(cx + rx1 * scale_x * inv_z))
+                sy = int(round(cy - ry2 * scale_y * inv_z))
+                if ay0 <= sy < ay0 + a_h and ax0 <= sx < ax0 + a_w:
+                    pos = (sy, sx)
+                    if pos not in z_buffer or z_buffer[pos][0] > rz2:
+                        dot_attr = C_DIM if rz2 > 3.7 else C_UNIT
+                        z_buffer[pos] = (rz2, "·", dot_attr)
+
+            # Draw solid shaded 3D Arch mesh
+            for px, py, pz, nx, ny, nz in ARCH_MESH:
+                # Rotate vertex
+                x1 = px * cos_y + pz * sin_y
+                z1 = -px * sin_y + pz * cos_y
+                y2 = py * cos_x - z1 * sin_x
+                z2 = py * sin_x + z1 * cos_x + 3.6
+
+                # Rotate normal
+                nx1 = nx * cos_y + nz * sin_y
+                nz1 = -nx * sin_y + nz * cos_y
+                ny2 = ny * cos_x - nz1 * sin_x
+                nz2 = ny * sin_x + nz1 * cos_x
+
+                inv_z = 2.6 / z2
+                sx = int(round(cx + x1 * scale_x * inv_z))
+                sy = int(round(cy - y2 * scale_y * inv_z))
+
+                if ay0 <= sy < ay0 + a_h and ax0 <= sx < ax0 + a_w:
+                    pos = (sy, sx)
+                    if pos not in z_buffer or z_buffer[pos][0] > z2:
+                        # Lambertian diffuse + ambient + soft specular
+                        diff = max(0.0, nx1 * lx + ny2 * ly + nz2 * lz)
+                        depth_boost = max(0.0, min(1.0, (4.3 - z2) / 1.4))
+                        lum = min(1.0, 0.16 + 0.68 * diff + 0.22 * depth_boost)
+                        char = SHADER_CHARS[max(1, int(lum * sh_n))]
+                        c_idx = min(arch_pal_n - 1, int(lum * (arch_pal_n - 1)))
+                        attr = ARCH_PALETTE[c_idx]
+                        if lum > 0.78:
+                            attr |= curses.A_BOLD
+                        z_buffer[pos] = (z2, char, attr)
+
+            for (sy, sx), (_, char, attr) in z_buffer.items():
+                try:
+                    stdscr.addch(sy, sx, char, attr)
+                except curses.error:
+                    pass
+
+            # Bottom System Vitals strip inside the Arch Core card
+            if show_vitals:
+                sep_y = y_bot_right + h_bot_right - 3
+                vit_y = y_bot_right + h_bot_right - 2
+                safe_addstr(stdscr, sep_y, x_right + 1, "─" * (w_right - 2), C_BORDER)
+
+                spark = render_sparkline(vitals.cpu_hist)
+                mem_bar = render_bar(vitals.mem_pct, 8)
+                cpu_str = f"󰍛 CPU {vitals.cpu_pct:4.1f}% "
+                mem_str = f"󰘚 MEM {vitals.mem_used_gb:.1f}/{vitals.mem_total_gb:.0f}G "
+
+                cur_x = ax0
+                safe_addstr(stdscr, vit_y, cur_x, cpu_str, C_CYAN_REG)
+                cur_x += len(cpu_str)
+                safe_addstr(stdscr, vit_y, cur_x, spark, C_PRIMARY)
+                cur_x += len(spark)
+
+                sep_str = "  │  "
+                if cur_x + len(sep_str) + len(mem_str) + len(mem_bar) <= x_right + w_right - 2:
+                    safe_addstr(stdscr, vit_y, cur_x, sep_str, C_BORDER)
+                    cur_x += len(sep_str)
+                    safe_addstr(stdscr, vit_y, cur_x, mem_str, C_LILAC)
+                    cur_x += len(mem_str)
+                    safe_addstr(stdscr, vit_y, cur_x, mem_bar, C_PINK if vitals.mem_pct > 80 else C_MINT)
+        except Exception:
+            pass
+
+        stdscr.refresh()
+        time.sleep(0.012)
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
