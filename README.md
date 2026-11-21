@@ -2,18 +2,9 @@
 
 A pitch-black OLED live desktop wallpaper dashboard for Wayland / Hyprland, rendered directly on the `wlr-layer-shell` background layer using `kitty +kitten panel` and Python `curses`.
 
-```text
-╭──────────────────────────╮  ╭──────────────────────────╮
-│                          │  │  󰎈 RADIAL SPECTRUM       │
-│  󰞌 SYSTEM JOURNAL        │  │  Braille 2x4 Subpixel    │
-│  Live sanitized logs     │  │  FFT Audio Visualizer    │
-│  (journalctl, semantic   │  ╰──────────────────────────╯
-│   highlighting)          │  ╭──────────────────────────╮
-│                          │  │  󰣇 ARCH CORE             │
-│                          │  │  3D Shaded Arch Logo     │
-│                          │  │  + Live CPU / MEM / UP   │
-╰──────────────────────────╯  ╰──────────────────────────╯
-```
+## How it Looks
+
+![Image](wallpaper.jpg)
 
 ## Features
 
